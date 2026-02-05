@@ -2,14 +2,13 @@
 Stage 2: AI-Powered Resume Parser
 This module takes extracted resume text and uses AI to parse it into structured data.
 """
-
 import json
 import os
+import time  # Added for rate limiting
 from google import genai
 from google.genai import types
 from typing import List, Optional
 import models
-
 
 def parse_resume_with_ai(client: genai.Client, resume_text):
     """
@@ -22,13 +21,11 @@ def parse_resume_with_ai(client: genai.Client, resume_text):
         dict: Structured resume information
     """
     print("Processing resume with AI model...")
-
     prompt = f"""Extract and return the structured resume information from the text below. Only use what is explicitly stated in the text and do not infer or invent any details.
-
     Resume text:
     {resume_text}
     """
-
+    
     response = client.models.generate_content(
         model="gemini-2.0-flash", 
         contents=prompt, 
@@ -37,4 +34,9 @@ def parse_resume_with_ai(client: genai.Client, resume_text):
             response_schema=models.Resume,
         )
     )
+    
+    # Rate limiting: Wait 6 seconds to stay under 10 RPM limit
+    print("Waiting to respect rate limits...")
+    time.sleep(7)
+    
     return response.text
