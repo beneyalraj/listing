@@ -4,16 +4,15 @@ import config
 from parse_resume_with_ai import parse_resume_with_ai
 import json
 from supabase_utils import save_resume_to_supabase 
+import time
 
 client = genai.Client(api_key=config.GEMINI_FIRST_API_KEY)
 
 def extract_text_from_pdf(pdf_path):
     """
     Extracts text from a given PDF file.
-
     Args:
         pdf_path (str): The file path to the PDF resume.
-
     Returns:
         str: The extracted text content from the PDF.
     """
@@ -33,13 +32,13 @@ def main(pdf_file_path):
     if not resume_text:
         print("Failed to extract text. Exiting.")
         return
-
+    
     # 2. Parse resume text with AI
     parsed_resume_details_str = parse_resume_with_ai(client, resume_text)
     if not parsed_resume_details_str:
         print("Failed to parse resume. Exiting.")
         return
-
+    
     try:
         # Convert the JSON string response to a dictionary
         resume_data_dict = json.loads(parsed_resume_details_str)
@@ -47,14 +46,13 @@ def main(pdf_file_path):
         print(f"Error decoding JSON response from AI: {e}")
         print(f"Raw response: {parsed_resume_details_str}")
         return
-
+    
     # 3. Save parsed data to Supabase
     save_resume_to_supabase(resume_data_dict) # Call the save function
-
+    
     print("\nResume processing finished.")
     # Optionally print the data that was sent to Supabase
     # print(json.dumps(resume_data_dict, indent=4))
-
 
 if __name__ == "__main__":
     pdf_path = "./resume.pdf"
