@@ -11,12 +11,133 @@ import html2text
 from google import genai
 from google.genai import types
 import json
+import os
 
 # --- Setup Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- Initialize Gemini Client ---
 client = genai.Client(api_key=config.GEMINI_FIRST_API_KEY)
+
+# =====================================================================
+# QUOTA TRACKING FOR GEMINI API
+# =====================================================================
+MAX_REQUESTS_PER_MINUTE = 4
+MAX_REQUESTS_PER_DAY = 20
+SECONDS_BETWEEN_REQUESTS = 60 / MAX_REQUESTS_PER_MINUTE  # 15 seconds
+QUOTA_STATE_FILE = "quota_state.json"
+
+
+def load_quota_state():
+    """Load quota state from file"""
+    if not os.path.exists(QUOTA_STATE_FILE):
+        return {
+            "daily_request_count": 0,
+            "daily_reset_date": None,
+            "request_timestamps": []
+        }
+    
+    try:
+        with open(QUOTA_STATE_FILE, 'r') as f:
+            state = json.load(f)
+            # Convert timestamp strings back to datetime objects
+            state["request_timestamps"] = [
+                datetime.fromisoformat(ts) for ts in state.get("request_timestamps", [])
+            ]
+            return state
+    except Exception as e:
+        logging.warning(f"Error loading quota state: {e}. Starting fresh.")
+        return {
+            "daily_request_count": 0,
+            "daily_reset_date": None,
+            "request_timestamps": []
+        }
+
+
+def save_quota_state(daily_count, reset_date, timestamps):
+    """Save quota state to file"""
+    state = {
+        "daily_request_count": daily_count,
+        "daily_reset_date": reset_date.isoformat() if reset_date else None,
+        "request_timestamps": [ts.isoformat() for ts in timestamps]
+    }
+    
+    try:
+        with open(QUOTA_STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2)
+    except Exception as e:
+        logging.warning(f"Error saving quota state: {e}")
+
+
+def check_and_enforce_quota():
+    """
+    Check quota limits and enforce rate limiting.
+    Returns True if request can proceed, False if quota exceeded.
+    """
+    # Load state from file
+    state = load_quota_state()
+    daily_request_count = state["daily_request_count"]
+    daily_reset_date = state["daily_reset_date"]
+    request_timestamps = state["request_timestamps"]
+    
+    # Parse reset date if it exists
+    if daily_reset_date:
+        daily_reset_date = datetime.fromisoformat(daily_reset_date).date()
+    
+    current_time = datetime.now()
+    
+    # Reset daily counter if it's a new day
+    if daily_reset_date is None or current_time.date() > daily_reset_date:
+        daily_request_count = 0
+        daily_reset_date = current_time.date()
+        request_timestamps = []
+        logging.info(f"📅 Daily quota reset for {daily_reset_date}")
+    
+    # Check daily limit
+    if daily_request_count >= MAX_REQUESTS_PER_DAY:
+        logging.warning(f"❌ Daily quota exceeded: {daily_request_count}/{MAX_REQUESTS_PER_DAY} requests used today")
+        logging.warning(f"⏳ Quota resets at midnight. Current time: {current_time.strftime('%H:%M:%S')}")
+        return False
+    
+    # Remove timestamps older than 1 minute
+    one_minute_ago = current_time - timedelta(minutes=1)
+    request_timestamps = [ts for ts in request_timestamps if ts > one_minute_ago]
+    
+    # Check RPM limit
+    if len(request_timestamps) >= MAX_REQUESTS_PER_MINUTE:
+        oldest_request = min(request_timestamps)
+        wait_time = 60 - (current_time - oldest_request).total_seconds()
+        if wait_time > 0:
+            logging.info(f"⏸️  RPM limit reached ({len(request_timestamps)}/{MAX_REQUESTS_PER_MINUTE})")
+            logging.info(f"⏳ Waiting {wait_time:.1f} seconds before next request...")
+            time.sleep(wait_time + 1)
+            current_time = datetime.now()
+    
+    # Enforce minimum time between requests (15 seconds for 4 RPM)
+    if request_timestamps:
+        last_request = max(request_timestamps)
+        elapsed = (current_time - last_request).total_seconds()
+        if elapsed < SECONDS_BETWEEN_REQUESTS:
+            wait_time = SECONDS_BETWEEN_REQUESTS - elapsed
+            logging.info(f"⏳ Rate limiting: waiting {wait_time:.1f} seconds...")
+            time.sleep(wait_time)
+            current_time = datetime.now()
+    
+    # Record this request
+    request_timestamps.append(current_time)
+    daily_request_count += 1
+    
+    logging.info(f"📊 Quota status: {daily_request_count}/{MAX_REQUESTS_PER_DAY} daily requests | "
+          f"{len(request_timestamps)}/{MAX_REQUESTS_PER_MINUTE} requests in last minute")
+    
+    # Save updated state to file
+    save_quota_state(daily_request_count, daily_reset_date, request_timestamps)
+    
+    return True
+
+# =====================================================================
+# END OF QUOTA TRACKING
+# =====================================================================
 
 # Convert description to Markdown
 def convert_plain_text_to_markdown_with_ai(text: str) -> str | None:
@@ -28,6 +149,11 @@ def convert_plain_text_to_markdown_with_ai(text: str) -> str | None:
         return "" 
 
     logging.info("Converting description text to Markdown using Gemini Lite...")
+
+    # ✅ CHECK QUOTA BEFORE MAKING REQUEST
+    if not check_and_enforce_quota():
+        logging.warning("⚠️ Gemini quota exceeded. Returning plain text instead of Markdown.")
+        return text  # Return original text when quota is exceeded
 
     system_prompt = f"""
     You are a Markdown formatter.
@@ -66,11 +192,23 @@ def convert_plain_text_to_markdown_with_ai(text: str) -> str | None:
         logging.info("Successfully converted text to Markdown.")
         if not markdown_content:
             logging.warning("Gemini returned empty markdown content for a non-empty input.") 
-            return ""
+            return text  # Return original text if conversion failed
         return markdown_content
     except Exception as e: 
-        logging.error(f"Error during Gemini Markdown conversion: {e}") 
-        return None 
+        logging.error(f"Error during Gemini Markdown conversion: {e}")
+        
+        # Decrement counter since request failed
+        state = load_quota_state()
+        state["daily_request_count"] = max(0, state["daily_request_count"] - 1)
+        
+        reset_date = state["daily_reset_date"]
+        if reset_date:
+            reset_date = datetime.fromisoformat(reset_date).date()
+        
+        timestamps = [datetime.fromisoformat(ts) for ts in state.get("request_timestamps", [])]
+        save_quota_state(state["daily_request_count"], reset_date, timestamps)
+        
+        return text  # Return original text on error
 
 def _get_careers_future_job_company_name(job_item: dict) -> str | None:
     """Helper to extract company name, preferring hiringCompany."""
@@ -226,7 +364,7 @@ def _fetch_linkedin_job_details(job_id: str) -> dict | None:
                 retries += 1
                 wait_time = config.RETRY_DELAY_SECONDS + random.uniform(0, 5) 
                 
-                logging.warning(f"Error 429 for job ID {job_id}. Retrying attempt {retries}/{config.MAX_RETRIES} after {wait_time:.2f} seconds...")
+                logging.warning(f"Error 429 for job ID {job_id}. Retrying attempt {retries}/{config.MAX_RETRIES} after {wait_time:.1f} seconds...")
                 time.sleep(wait_time)
                 user_agent = random.choice(user_agents.USER_AGENTS)
                 headers = {'User-Agent': user_agent}
